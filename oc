@@ -1,0 +1,985 @@
+#!/usr/bin/env python3
+"""OpenCode orchestrator CLI — manage sessions across instances and projects."""
+import base64, json, os, sys, time, urllib.request, urllib.error
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.environ.get(
+    "OPENCODE_INSTANCES_CONFIG",
+    os.path.join(SCRIPT_DIR, "instances.json"),
+)
+STATE_PATH = os.path.join(SCRIPT_DIR, "state.json")
+
+
+ALLOWED_MODELS = set()
+
+
+def load_config():
+    global ALLOWED_MODELS
+    with open(CONFIG_PATH) as f:
+        raw = json.load(f)
+    models = raw.pop("allowed_models", [])
+    ALLOWED_MODELS = {tuple(m.split("/", 1)) for m in models}
+    return raw
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+
+
+def req(instance, path, method="GET", body=None, directory=None, timeout=30):
+    """Make a request to an OpenCode instance. Raises RuntimeError on failure."""
+    url = instance["url"].rstrip("/") + path
+    headers = {}
+    d = directory or instance.get("directory")
+    if d:
+        headers["x-opencode-directory"] = d
+    pw = instance.get("password")
+    if pw:
+        user = instance.get("username", "opencode")
+        cred = base64.b64encode(f"{user}:{pw}".encode()).decode()
+        headers["Authorization"] = f"Basic {cred}"
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    r = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        resp = urllib.request.urlopen(r, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {body_text}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Connection error: {e.reason}")
+    raw = resp.read().decode()
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+# ── State management ─────────────────────────────────────────────────────────
+#
+# state.json tracks the mapping between session IDs and their directories so
+# that every command can automatically forward the right x-opencode-directory
+# header. Structure:
+#
+#   { "<instance>": { "sessions": { "<sid>": { "directory": "...", "title": "..." } },
+#                      "directories": ["...", ...] } }
+
+
+def load_state():
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def _inst(state, name):
+    """Ensure instance entry exists in state and return it."""
+    if name not in state:
+        state[name] = {"sessions": {}, "directories": []}
+    s = state[name]
+    if "sessions" not in s:
+        s["sessions"] = {}
+    if "directories" not in s:
+        s["directories"] = []
+    return s
+
+
+def _normdir(d):
+    """Normalize a directory path — resolve `.`, `..`, trailing slashes."""
+    if not d:
+        return d
+    return os.path.normpath(d)
+
+
+def state_register(state, inst_name, session_id, directory, title=""):
+    s = _inst(state, inst_name)
+    directory = _normdir(directory)
+    s["sessions"][session_id] = {"directory": directory, "title": title}
+    if directory and directory not in s["directories"]:
+        s["directories"].append(directory)
+
+
+def resolve_sid(state, inst_name, prefix):
+    """Resolve a session ID prefix to the full ID. Returns (full_id, error_msg)."""
+    s = state.get(inst_name, {}).get("sessions", {})
+    # Exact match first
+    if prefix in s:
+        return prefix, None
+    # Prefix match
+    matches = [sid for sid in s if sid.startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) == 0:
+        return prefix, None  # not found in state, pass through for server to reject
+    return None, f"Ambiguous prefix '{prefix}' matches {len(matches)} sessions: {', '.join(m[:20] for m in matches[:5])}"
+
+
+def state_dir(state, inst_name, session_id):
+    """Look up directory for a session from local state."""
+    s = state.get(inst_name, {})
+    sess = s.get("sessions", {}).get(session_id)
+    return sess.get("directory") if sess else None
+
+
+def state_dirs(state, inst_name):
+    return list(state.get(inst_name, {}).get("directories", []))
+
+
+# ── Formatting ───────────────────────────────────────────────────────────────
+
+
+def fmt_session(s):
+    sid = s.get("id", "?")
+    title = s.get("title") or "(untitled)"
+    d = s.get("directory", "")
+    proj = os.path.basename(d) if d else "?"
+    return f"  {sid}  {proj:20s} {title}"
+
+
+def fmt_message(m):
+    info = m.get("info", {})
+    role = info.get("role", m.get("role", "?"))
+    error = info.get("error")
+    parts = m.get("parts", [])
+    lines = []
+
+    if error:
+        msg = error.get("data", {}).get("message", str(error))
+        lines.append(f"  [{role:9s}] ERROR: {msg}")
+
+    for p in parts:
+        t = p.get("type", "?")
+        if t == "text" and p.get("text"):
+            for line in p["text"].splitlines():
+                lines.append(f"  [{role:9s}] {line}")
+        elif t == "tool-invocation":
+            tool = p.get("toolName", "?")
+            inp = p.get("input", {})
+            detail = ""
+            if isinstance(inp, dict):
+                detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or ""
+                if isinstance(detail, str):
+                    detail = detail.split("\n")[0][:120]
+            lines.append(f"  [{role:9s}] >> {tool}: {detail}")
+        # skip tool-result (noisy)
+    return "\n".join(lines)
+
+
+# ── Polling ──────────────────────────────────────────────────────────────────
+
+
+def is_model_allowed(provider, model):
+    """Check if a provider/model combo is in the whitelist."""
+    return (provider, model) in ALLOWED_MODELS
+
+
+def parse_model(spec):
+    """Parse 'provider/model' into {"providerID": ..., "modelID": ...} or None.
+    Enforces ALLOWED_MODELS whitelist."""
+    if not spec:
+        return None
+    if "/" in spec:
+        provider, model = spec.split("/", 1)
+    elif spec.startswith("claude") or spec.startswith("anthropic"):
+        provider, model = "anthropic", spec
+    elif spec.startswith("gpt") or spec.startswith("o1") or spec.startswith("o3") or spec.startswith("o4"):
+        provider, model = "openai", spec
+    elif spec.startswith("gemini"):
+        provider, model = "google", spec
+    else:
+        provider, model = "custom", spec
+
+    if not is_model_allowed(provider, model):
+        allowed_str = ", ".join(f"{p}/{m}" for p, m in sorted(ALLOWED_MODELS))
+        print(f"Error: model '{provider}/{model}' not in whitelist.", file=sys.stderr)
+        print(f"Allowed models: {allowed_str}", file=sys.stderr)
+        sys.exit(1)
+
+    return {"providerID": provider, "modelID": model}
+
+
+def make_prompt_body(text, model=None):
+    """Build prompt body with optional model override."""
+    body = {"parts": [{"type": "text", "text": text}]}
+    if model:
+        body["model"] = model
+    return body
+
+
+def wait_idle(inst, directory, session_id=None, timeout=120, interval=3):
+    """Poll until session(s) are idle. Returns True on idle, False on timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            statuses = req(inst, "/session/status", directory=directory)
+        except RuntimeError:
+            return False
+        if not statuses:
+            return True
+        if session_id:
+            s = statuses.get(session_id, {})
+            st = s if isinstance(s, str) else s.get("type", "")
+            if st != "busy":
+                return True
+        else:
+            if all(
+                (v if isinstance(v, str) else v.get("type", "")) != "busy"
+                for v in statuses.values()
+            ):
+                return True
+        time.sleep(interval)
+    return False
+
+
+# ── Multi-directory helpers ──────────────────────────────────────────────────
+#
+# Many endpoints are project-scoped. These helpers query across all known
+# directories and deduplicate results.
+
+
+def _discover_dirs(inst, state, inst_name):
+    """Fresh-crawl session listings to discover all directories on this instance.
+
+    Starts from the server's CWD (no header) and iteratively expands by
+    querying directories found in session data.  Updates state as a side effect.
+    Returns the set of discovered directories.
+    """
+    s = _inst(state, inst_name)
+    to_query = {""}  # start with server CWD
+    # Also seed from projects_path so we discover sessions in new projects
+    pp = inst.get("projects_path")
+    if pp:
+        to_query.add(pp.rstrip("/"))
+    queried = set()
+    while to_query - queried:
+        batch = list(to_query - queried)
+        for d in batch:
+            queried.add(d)
+            try:
+                sessions = req(inst, "/session", directory=d or None)
+            except RuntimeError:
+                continue
+            if not sessions:
+                continue
+            for sess in sessions:
+                sid = sess.get("id")
+                sess_dir = _normdir(sess.get("directory", ""))
+                title = sess.get("title", "")
+                if sid:
+                    s["sessions"][sid] = {"directory": sess_dir, "title": title}
+                if sess_dir and sess_dir not in queried:
+                    to_query.add(sess_dir)
+    # Rebuild directories from sessions
+    all_dirs = {sess.get("directory") for sess in s["sessions"].values() if sess.get("directory")}
+    s["directories"] = sorted(all_dirs)
+    save_state(state)
+    return all_dirs
+
+
+def _query_all_dirs(inst, state, inst_name, path, merge_key="id"):
+    """Query `path` across all directories, discovered fresh from the server."""
+    dirs = _discover_dirs(inst, state, inst_name)
+    seen = set()
+    results = []
+    for d in sorted(dirs):
+        try:
+            items = req(inst, path, directory=d or None)
+            if not items:
+                continue
+            if isinstance(items, list):
+                for item in items:
+                    k = item.get(merge_key) or item.get("requestID") or id(item)
+                    if k not in seen:
+                        seen.add(k)
+                        item["_directory"] = d
+                        results.append(item)
+        except RuntimeError:
+            pass
+    return results
+
+
+def _try_all_dirs(inst, state, inst_name, path, method="POST", body=None):
+    """Try a request against each known directory until one succeeds."""
+    dirs = state_dirs(state, inst_name) or [""]
+    for d in sorted(dirs):
+        try:
+            return req(inst, path, method=method, body=body, directory=d or None)
+        except RuntimeError:
+            continue
+    return None
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+
+def cmd_instances(cfg, state, _args):
+    for name, inst in cfg.items():
+        s = _inst(state, name)
+        ns = len(s["sessions"])
+        nd = len(s["directories"])
+        try:
+            data = req(inst, "/global/health")
+            ver = data.get("version", "?") if data else "?"
+            print(f"  {name:16s} {inst['url']:30s} v{ver}  {ns} sessions  {nd} projects")
+        except RuntimeError:
+            print(f"  {name:16s} {inst['url']:30s} UNREACHABLE  ({ns} cached)")
+
+
+def cmd_sync(cfg, state, args):
+    targets = {args[0]: cfg[args[0]]} if args and args[0] in cfg else cfg
+
+    for name, inst in targets.items():
+        s = _inst(state, name)
+        to_query = set(s["directories"])
+        to_query.add("")  # server default (no directory header)
+        # Also seed from projects_path so we discover sessions in new projects
+        pp = inst.get("projects_path")
+        if pp:
+            to_query.add(pp.rstrip("/"))
+        queried = set()
+
+        while to_query - queried:
+            batch = list(to_query - queried)
+            for d in batch:
+                queried.add(d)
+                try:
+                    sessions = req(inst, "/session", directory=d or None)
+                except RuntimeError:
+                    continue
+                if not sessions:
+                    continue
+                for sess in sessions:
+                    sid = sess.get("id")
+                    sess_dir = _normdir(sess.get("directory", ""))
+                    title = sess.get("title", "")
+                    if sid:
+                        s["sessions"][sid] = {"directory": sess_dir, "title": title}
+                    if sess_dir and sess_dir not in queried:
+                        to_query.add(sess_dir)
+
+        # Rebuild directories from sessions
+        all_dirs = set()
+        for sess in s["sessions"].values():
+            d = sess.get("directory")
+            if d:
+                all_dirs.add(d)
+        s["directories"] = sorted(all_dirs)
+
+        save_state(state)
+        print(f"  {name}: {len(s['sessions'])} sessions across {len(s['directories'])} projects")
+
+
+def cmd_models(inst_name, inst, state, args):
+    try:
+        data = req(inst, "/provider")
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not data:
+        print("  (no providers)")
+        return
+    connected = set(data.get("connected", []))
+    defaults = data.get("default", {})
+    providers = data.get("all", [])
+    for p in providers:
+        pid = p["id"]
+        if pid not in connected:
+            continue
+        models = p.get("models", {})
+        if not models:
+            continue
+        active = [m for m in models.values() if m.get("status") == "active"]
+        # Filter to whitelisted models only
+        active = [m for m in active if is_model_allowed(pid, m["id"])]
+        if not active:
+            continue
+        default_mid = defaults.get(pid, "")
+        print(f"  {pid}:")
+        for m in active:
+            mid = m["id"]
+            name = m.get("name", mid)
+            ctx = m.get("limit", {}).get("context", 0)
+            ctx_k = f"{ctx // 1000}k" if ctx else "?"
+            caps = []
+            c = m.get("capabilities", {})
+            if c.get("toolcall"):
+                caps.append("tools")
+            if c.get("reasoning"):
+                caps.append("reasoning")
+            inp = c.get("input", {})
+            if inp.get("image"):
+                caps.append("vision")
+            if inp.get("audio"):
+                caps.append("audio")
+            cap_str = ",".join(caps) if caps else ""
+            marker = " *" if mid == default_mid else ""
+            print(f"    {pid}/{mid:40s} {ctx_k:>6s}  {cap_str:20s} {name}{marker}")
+        print()
+
+
+def _session_model(inst, directory, session_id):
+    """Get the model used in a session's last assistant message."""
+    try:
+        msgs = req(inst, f"/session/{session_id}/message?limit=1", directory=directory)
+        if msgs:
+            for m in reversed(msgs):
+                info = m.get("info", {})
+                if info.get("role") == "assistant" and info.get("modelID"):
+                    return f"{info.get('providerID', '?')}/{info['modelID']}"
+    except RuntimeError:
+        pass
+    return None
+
+
+def cmd_sessions(inst_name, inst, state, args):
+    limit = 30
+    show_model = False
+    while args and args[0].startswith("--"):
+        if args[0] == "--limit":
+            args.pop(0)
+            limit = int(args.pop(0)) if args else 30
+        elif args[0] == "--model":
+            args.pop(0)
+            show_model = True
+        else:
+            break
+
+    sessions = _query_all_dirs(inst, state, inst_name, "/session")
+
+    # Update state with discovered sessions
+    for sess in sessions:
+        state_register(state, inst_name, sess["id"], sess.get("directory", ""), sess.get("title", ""))
+    save_state(state)
+
+    if not sessions:
+        print("  (no sessions)")
+        return
+
+    sessions.sort(key=lambda x: x.get("time", {}).get("created", 0), reverse=True)
+    for sess in sessions[:limit]:
+        line = fmt_session(sess)
+        if show_model:
+            model = _session_model(inst, sess.get("directory", ""), sess["id"])
+            if model:
+                line += f"  [{model}]"
+        print(line)
+    if len(sessions) > limit:
+        print(f"  ... {len(sessions) - limit} more (use --limit)")
+
+
+def cmd_create(inst_name, inst, state, args):
+    body = {}
+    directory = None
+    yolo = False
+    model = None
+
+    while args:
+        if args[0] == "--title":
+            args.pop(0)
+            body["title"] = args.pop(0) if args else "untitled"
+        elif args[0] == "--directory":
+            args.pop(0)
+            d = args.pop(0) if args else ""
+            if d.startswith("/"):
+                directory = _normdir(d)
+            elif inst.get("projects_path"):
+                directory = _normdir(os.path.join(inst["projects_path"], d))
+            else:
+                print(f"Relative directory '{d}' requires projects_path in config", file=sys.stderr)
+                sys.exit(1)
+            # Warn if resolved directory equals projects_path (common with '.')
+            pp = inst.get("projects_path")
+            if pp and directory == _normdir(pp):
+                print(f"  Note: --directory '{d}' resolves to projects_path itself ({directory})", file=sys.stderr)
+        elif args[0] == "--yolo":
+            args.pop(0)
+            yolo = True
+        elif args[0] == "--model":
+            args.pop(0)
+            model = parse_model(args.pop(0)) if args else None
+        else:
+            break
+
+    if yolo:
+        body["permission"] = [{"permission": "*", "pattern": "*", "action": "allow"}]
+
+    # Bootstrap: if directory is new, create it on the remote machine
+    if directory and directory not in state_dirs(state, inst_name):
+        projects_path = inst.get("projects_path")
+        if projects_path:
+            print(f"  Bootstrapping: {directory}")
+            try:
+                bs = req(
+                    inst, "/session", method="POST",
+                    body={
+                        "title": f"[bootstrap] {os.path.basename(directory)}",
+                        "permission": [{"permission": "*", "pattern": "*", "action": "allow"}],
+                    },
+                    directory=projects_path,
+                )
+                bs_id = bs["id"]
+                state_register(state, inst_name, bs_id, projects_path, bs["title"])
+
+                req(
+                    inst, f"/session/{bs_id}/prompt_async", method="POST",
+                    body={"parts": [{"type": "text", "text":
+                        f"Run exactly: mkdir -p {directory} && cd {directory} && git init && echo done"}]},
+                    directory=projects_path,
+                )
+                if wait_idle(inst, projects_path, bs_id, timeout=60):
+                    print(f"  Directory ready")
+                else:
+                    print(f"  Warning: bootstrap may not have completed", file=sys.stderr)
+            except RuntimeError as e:
+                print(f"  Warning: bootstrap failed ({e}), creating session anyway", file=sys.stderr)
+
+    try:
+        s = req(inst, "/session", method="POST", body=body or None, directory=directory)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    sid = s["id"]
+    title = s.get("title", "")
+    state_register(state, inst_name, sid, directory or "", title)
+    if model:
+        state.get(inst_name, {}).get("sessions", {}).get(sid, {})["model"] = model
+    save_state(state)
+
+    print(f"  Created: {sid}  {title}")
+    if directory:
+        print(f"  Directory: {directory}")
+    if model:
+        print(f"  Model: {model['providerID']}/{model['modelID']}")
+
+
+def cmd_status(inst_name, inst, state, args):
+    dirs = _discover_dirs(inst, state, inst_name) or {""}
+    any_active = False
+    all_perms = []
+    all_questions = []
+
+    for d in dirs:
+        try:
+            statuses = req(inst, "/session/status", directory=d or None)
+            if statuses:
+                for sid, info in statuses.items():
+                    st = info if isinstance(info, str) else info.get("type", str(info))
+                    # Enrich idle status: check if session has ever produced output
+                    if st == "idle":
+                        try:
+                            msgs = req(inst, f"/session/{sid}/message?limit=1", directory=d or None)
+                            if msgs:
+                                st = "idle"
+                            else:
+                                st = "idle/empty"
+                        except RuntimeError:
+                            st = "idle/?"
+                    title = state.get(inst_name, {}).get("sessions", {}).get(sid, {}).get("title", "")
+                    proj = os.path.basename(d) if d else "?"
+                    print(f"  {sid}  {proj:20s} {st:12s} {title}")
+                    any_active = True
+        except RuntimeError:
+            pass
+        try:
+            perms = req(inst, "/permission", directory=d or None)
+            if perms:
+                all_perms.extend(perms)
+        except RuntimeError:
+            pass
+        try:
+            qs = req(inst, "/question", directory=d or None)
+            if qs:
+                all_questions.extend(qs)
+        except RuntimeError:
+            pass
+
+    if not any_active:
+        print("  (all idle)")
+
+    # Deduplicate permissions
+    seen = set()
+    for p in all_perms:
+        pid = p.get("id", p.get("requestID", ""))
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if len(seen) == 1:
+            print()
+        rid = pid
+        desc = p.get("description") or p.get("tool") or "?"
+        sid = p.get("sessionID", "?")
+        print(f"  PERM  {rid}  session={sid}  {desc}")
+
+    seen = set()
+    for q in all_questions:
+        qid = q.get("id", q.get("requestID", ""))
+        if qid in seen:
+            continue
+        seen.add(qid)
+        if len(seen) == 1:
+            print()
+        rid = qid
+        text = q.get("text") or q.get("question") or "?"
+        print(f"  QUES  {rid}  {text[:80]}")
+
+
+def cmd_prompt(inst_name, inst, state, args):
+    model = None
+    # Parse flags before positional args
+    while args and args[0].startswith("--"):
+        if args[0] == "--model":
+            args.pop(0)
+            model = parse_model(args.pop(0)) if args else None
+        else:
+            break
+
+    if len(args) < 2:
+        print("Usage: oc <inst> prompt [--model provider/model] <session_id> <text>", file=sys.stderr)
+        sys.exit(1)
+    session_id, err = resolve_sid(state, inst_name, args[0])
+    if err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
+    text = " ".join(args[1:])
+    d = state_dir(state, inst_name, session_id)
+    if not d:
+        print(f"  Warning: {session_id} not in state, run 'oc sync {inst_name}'", file=sys.stderr)
+    # Fall back to model stored in state from create --model
+    if not model:
+        model = state.get(inst_name, {}).get("sessions", {}).get(session_id, {}).get("model")
+    try:
+        req(inst, f"/session/{session_id}/prompt_async", method="POST",
+            body=make_prompt_body(text, model), directory=d)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    msg = f"  Prompt sent to {session_id}"
+    if model:
+        msg += f"  (model: {model['providerID']}/{model['modelID']})"
+    print(msg)
+    # Verify delivery: check session status after a brief pause
+    time.sleep(1)
+    try:
+        statuses = req(inst, "/session/status", directory=d)
+        if statuses:
+            info = statuses.get(session_id)
+            st = info if isinstance(info, str) else (info.get("type", "") if info else "")
+            if st == "busy":
+                print(f"  Status: busy (confirmed)")
+            elif st:
+                print(f"  Warning: session is '{st}' — prompt may not have been delivered", file=sys.stderr)
+            else:
+                print(f"  Warning: session {session_id} not found in status response — check directory mapping", file=sys.stderr)
+        else:
+            print(f"  Warning: empty status response — session may not exist in directory {d}", file=sys.stderr)
+    except RuntimeError:
+        pass  # non-fatal, just skip verification
+
+
+def cmd_messages(inst_name, inst, state, args):
+    if not args:
+        print("Usage: oc <inst> messages <session_id> [--limit N]", file=sys.stderr)
+        sys.exit(1)
+    session_id, err = resolve_sid(state, inst_name, args.pop(0))
+    if err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
+    d = state_dir(state, inst_name, session_id)
+    if not d:
+        print(f"  Warning: {session_id} not in state, run 'oc sync {inst_name}'", file=sys.stderr)
+
+    limit = None
+    if args and args[0] == "--limit":
+        args.pop(0)
+        limit = args.pop(0) if args else "10"
+    qs = f"?limit={limit}" if limit else ""
+
+    try:
+        msgs = req(inst, f"/session/{session_id}/message{qs}", directory=d)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not msgs:
+        print("  (no messages)")
+        return
+    for m in msgs:
+        line = fmt_message(m)
+        if line:
+            print(line)
+
+
+def cmd_abort(inst_name, inst, state, args):
+    if not args:
+        print("Usage: oc <inst> abort <session_id>", file=sys.stderr)
+        sys.exit(1)
+    session_id, err = resolve_sid(state, inst_name, args[0])
+    if err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
+    d = state_dir(state, inst_name, session_id)
+    try:
+        req(inst, f"/session/{session_id}/abort", method="POST", directory=d)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Aborted {session_id}")
+
+
+def cmd_permissions(inst_name, inst, state, _args):
+    perms = _query_all_dirs(inst, state, inst_name, "/permission", merge_key="id")
+    if not perms:
+        print("  (no pending permissions)")
+        return
+    for p in perms:
+        rid = (p.get("id") or p.get("requestID", "?"))
+        desc = p.get("description") or p.get("tool") or "?"
+        sid = p.get("sessionID", "?")
+        proj = os.path.basename(p.get("_directory", "")) or "?"
+        print(f"  {rid}  [{proj}] session={sid}  {desc}")
+
+
+def cmd_approve(inst_name, inst, state, args):
+    if not args:
+        print("Usage: oc <inst> approve <request_id> [--always]", file=sys.stderr)
+        sys.exit(1)
+    rid = args.pop(0)
+    reply = "always" if args and args[0] == "--always" else "once"
+    result = _try_all_dirs(inst, state, inst_name,
+                           f"/permission/{rid}/reply", body={"reply": reply})
+    if result is not None:
+        print(f"  Approved {rid} ({reply})")
+    else:
+        print(f"  Failed: permission {rid} not found", file=sys.stderr)
+
+
+def cmd_reject(inst_name, inst, state, args):
+    if not args:
+        print("Usage: oc <inst> reject <request_id>", file=sys.stderr)
+        sys.exit(1)
+    result = _try_all_dirs(inst, state, inst_name,
+                           f"/permission/{args[0]}/reply", body={"reply": "reject"})
+    if result is not None:
+        print(f"  Rejected {args[0]}")
+    else:
+        print(f"  Failed: permission {args[0]} not found", file=sys.stderr)
+
+
+def cmd_questions(inst_name, inst, state, _args):
+    qs = _query_all_dirs(inst, state, inst_name, "/question", merge_key="id")
+    if not qs:
+        print("  (no pending questions)")
+        return
+    for q in qs:
+        rid = (q.get("id") or q.get("requestID", "?"))
+        text = q.get("text") or q.get("question") or "?"
+        print(f"  {rid}  {text[:80]}")
+
+
+def cmd_answer(inst_name, inst, state, args):
+    if len(args) < 2:
+        print("Usage: oc <inst> answer <request_id> <answer>", file=sys.stderr)
+        sys.exit(1)
+    rid = args[0]
+    answer = " ".join(args[1:])
+    result = _try_all_dirs(inst, state, inst_name,
+                           f"/question/{rid}/reply", body={"answers": [[answer]]})
+    if result is not None:
+        print(f"  Answered {rid}")
+    else:
+        print(f"  Failed: question {rid} not found", file=sys.stderr)
+
+
+def cmd_diagnose(inst_name, inst, state, args):
+    if not args:
+        print("Usage: oc <inst> diagnose <session_id>", file=sys.stderr)
+        sys.exit(1)
+    session_id, err = resolve_sid(state, inst_name, args[0])
+    if err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
+    ok = True
+
+    # 1. Check local state
+    cached = state.get(inst_name, {}).get("sessions", {}).get(session_id)
+    if cached:
+        d = cached.get("directory", "")
+        print(f"  State:     found (dir={d}, title={cached.get('title', '?')})")
+    else:
+        d = None
+        print(f"  State:     NOT FOUND — run 'oc sync {inst_name}'")
+        ok = False
+
+    # 2. Check instance health
+    try:
+        health = req(inst, "/global/health")
+        ver = health.get("version", "?") if health else "?"
+        print(f"  Instance:  reachable (v{ver})")
+    except RuntimeError as e:
+        print(f"  Instance:  UNREACHABLE ({e})")
+        ok = False
+        print(f"\n  Diagnosis: instance is down or unreachable")
+        return
+
+    # 3. Check if session exists on server
+    if d:
+        try:
+            sessions = req(inst, "/session", directory=d)
+            found = any(s.get("id") == session_id for s in (sessions or []))
+            if found:
+                print(f"  Server:    session exists in dir={d}")
+            else:
+                print(f"  Server:    session NOT FOUND in dir={d}")
+                ok = False
+                # Try without directory header
+                try:
+                    sessions2 = req(inst, "/session")
+                    found2 = any(s.get("id") == session_id for s in (sessions2 or []))
+                    if found2:
+                        real_dir = next(s.get("directory") for s in sessions2 if s.get("id") == session_id)
+                        print(f"  Server:    session found at dir={real_dir} (state has wrong directory!)")
+                except RuntimeError:
+                    pass
+        except RuntimeError as e:
+            print(f"  Server:    error querying sessions ({e})")
+            ok = False
+
+    # 4. Check session status
+    if d:
+        try:
+            statuses = req(inst, "/session/status", directory=d)
+            if statuses:
+                info = statuses.get(session_id)
+                if info:
+                    st = info if isinstance(info, str) else info.get("type", str(info))
+                    print(f"  Status:    {st}")
+                else:
+                    print(f"  Status:    session not in status response (directory mismatch?)")
+                    ok = False
+            else:
+                print(f"  Status:    empty response (no sessions in this directory)")
+                ok = False
+        except RuntimeError as e:
+            print(f"  Status:    error ({e})")
+            ok = False
+
+    # 5. Check if session has any messages
+    if d:
+        try:
+            msgs = req(inst, f"/session/{session_id}/message?limit=1", directory=d)
+            if msgs:
+                print(f"  Messages:  has output")
+            else:
+                print(f"  Messages:  empty (never produced output)")
+                ok = False
+        except RuntimeError as e:
+            print(f"  Messages:  error ({e})")
+
+    # 6. Check directory normalization
+    if d:
+        normed = _normdir(d)
+        if d != normed:
+            print(f"  Path:      UNNORMALIZED stored='{d}' should be='{normed}'")
+            ok = False
+        else:
+            print(f"  Path:      normalized OK")
+
+    print()
+    if ok:
+        print(f"  Diagnosis: session looks healthy")
+    else:
+        print(f"  Diagnosis: issues detected (see above)")
+
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+
+INSTANCE_CMDS = {
+    "models": cmd_models,
+    "sessions": cmd_sessions,
+    "create": cmd_create,
+    "status": cmd_status,
+    "prompt": cmd_prompt,
+    "messages": cmd_messages,
+    "abort": cmd_abort,
+    "permissions": cmd_permissions,
+    "approve": cmd_approve,
+    "reject": cmd_reject,
+    "questions": cmd_questions,
+    "answer": cmd_answer,
+    "diagnose": cmd_diagnose,
+}
+
+USAGE = f"""Usage: oc instances
+       oc sync [<instance>]
+       oc <instance> <command> [args...]
+
+Commands:
+  instances                                         List instances + health + state summary
+  sync [<instance>]                                 Discover sessions/projects, update local state
+
+  <inst> models                                     List connected providers and models
+  <inst> sessions [--limit N] [--model]              List sessions (--model shows active model)
+  <inst> create [--title T] [--directory D] [--yolo] [--model P/M]  Create session
+  <inst> status                                     Active sessions + permissions + questions
+  <inst> prompt [--model P/M] <session> <text>      Send prompt (model: provider/model)
+  <inst> messages <session> [--limit N]             Read messages (formatted)
+  <inst> abort <session>                            Abort running session
+  <inst> diagnose <session>                         Check session health (state, server, messages)
+  <inst> permissions                                List pending permissions (all projects)
+  <inst> approve <id> [--always]                    Approve permission
+  <inst> reject <id>                                Reject permission
+  <inst> questions                                  List pending questions (all projects)
+  <inst> answer <id> <text>                         Answer a question
+
+Config: {CONFIG_PATH}
+State:  {STATE_PATH}"""
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(USAGE)
+        sys.exit(0)
+
+    cfg = load_config()
+    state = load_state()
+
+    # Global commands
+    if args[0] == "instances":
+        cmd_instances(cfg, state, args[1:])
+        return
+    if args[0] == "sync":
+        cmd_sync(cfg, state, args[1:])
+        return
+
+    # Instance commands
+    name = args[0]
+    if name not in cfg:
+        print(f"Unknown instance: {name}", file=sys.stderr)
+        print(f"Available: {', '.join(cfg.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    if len(args) < 2:
+        print(f"Missing command for instance '{name}'", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = args[1]
+    if cmd not in INSTANCE_CMDS:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        print(f"Available: {', '.join(INSTANCE_CMDS.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    INSTANCE_CMDS[cmd](name, cfg[name], state, args[2:])
+
+
+if __name__ == "__main__":
+    main()

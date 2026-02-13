@@ -1,0 +1,14 @@
+{
+  "allowed_models": [
+    "openai/gpt-5.3-codex",
+    "zai-coding-plan/glm-4.7"
+  ],
+  "local": {
+    "url": "http://localhost:4096",
+    "projects_path": "/home/user/projects"
+  },
+  "dev-server": {
+    "url": "http://192.168.1.100:4096",
+    "projects_path": "/home/user/dev/projects"
+  }
+}
